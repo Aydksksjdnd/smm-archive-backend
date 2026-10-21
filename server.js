@@ -102,7 +102,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
   const pr = (await db.query('select id,title,price from products where id=any($1)', [ids])).rows;
   let total = 0; const lines = [];
   for (const i of items) {
-    const p = pr.find(x => x.id === toId(i.id)), q = parseInt(i.qty);
+    const p = pr.find(x => Number(x.id) === toId(i.id)), q = parseInt(i.qty); // Number(): pg отдаёт bigint строкой
     if (!p || !(q > 0 && q <= 20)) return bad(res, 'Товар не найден или неверное количество');
     lines.push({ id: p.id, title: p.title, size: String(i.size || '').slice(0, 10), qty: q, price: Number(p.price) });
     total += Number(p.price) * q;
