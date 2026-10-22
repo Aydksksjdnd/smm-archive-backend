@@ -68,6 +68,60 @@ app.post('/api/auth/verify', authLimit, wrap(async (req, res) => {
   res.json(out(u));
 }));
 
+// ===== Telegram: привязка по коду, уведомления, рассылка =====
+const { TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, TELEGRAM_BOT_USERNAME = 'smmarchive_bot' } = process.env;
+const tgApi = (method, body) => fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  .then(r => r.json()).catch(e => ({ ok: false, description: String(e) }));
+const tgSend = (chat, text) => TELEGRAM_BOT_TOKEN ? tgApi('sendMessage', { chat_id: chat, text: String(text).slice(0, 4000), disable_web_page_preview: true }) : Promise.resolve({ ok: false });
+const tgNotifyUser = async (userId, text) => { try { const r = await db.query('select tg_id from users where id=$1 and is_tg_verified=1', [userId]); if (r.rows[0] && r.rows[0].tg_id) await tgSend(r.rows[0].tg_id, text); } catch (e) { console.error('tg user', e.message); } };
+const tgNotifyAdmins = async text => { try { const r = await db.query('select tg_id from users where is_admin=1 and is_tg_verified=1 and tg_id is not null'); for (const u of r.rows) await tgSend(u.tg_id, text); } catch (e) { console.error('tg admins', e.message); } };
+async function setupTelegram() {
+  const base = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_WEBHOOK_SECRET || !base) return console.log('Telegram не настроен (нужны TELEGRAM_BOT_TOKEN и TELEGRAM_WEBHOOK_SECRET)');
+  const r = await tgApi('setWebhook', { url: base.replace(/\/$/, '') + '/api/telegram/webhook', secret_token: TELEGRAM_WEBHOOK_SECRET, allowed_updates: ['message'] });
+  console.log('Telegram webhook:', r.ok ? 'установлен' : 'ОШИБКА ' + r.description);
+}
+app.post('/api/telegram/webhook', wrap(async (req, res) => {
+  if (!TELEGRAM_WEBHOOK_SECRET || req.get('x-telegram-bot-api-secret-token') !== TELEGRAM_WEBHOOK_SECRET) return res.sendStatus(403);
+  res.sendStatus(200);
+  const m = req.body && req.body.message; if (!m || !m.chat || m.chat.type !== 'private') return;
+  const chat = String(m.chat.id), text = String(m.text || '').trim();
+  if (/^\d{6}$/.test(text)) {
+    const r = await db.query('select id,login from users where tg_code=$1', [text]);
+    if (!r.rows[0]) return void tgSend(chat, 'Код не найден или уже использован. Получите новый код в личном кабинете на сайте.');
+    await db.query('update users set tg_id=null, is_tg_verified=0 where tg_id=$1', [chat]); // один Telegram = один аккаунт
+    await db.query('update users set tg_id=$1, is_tg_verified=1, tg_code=null where id=$2', [chat, r.rows[0].id]);
+    return void tgSend(chat, `Готово! Telegram привязан к аккаунту ${r.rows[0].login}. Теперь здесь будут приходить статусы заказов и новости магазина. Отключить: /stop`);
+  }
+  if (text === '/stop') { await db.query('update users set tg_id=null, is_tg_verified=0 where tg_id=$1', [chat]); return void tgSend(chat, 'Уведомления отключены. Привязать снова можно в личном кабинете на сайте.'); }
+  tgSend(chat, 'Здравствуйте! Это бот магазина SMM Archive. Чтобы получать уведомления, зайдите в личный кабинет на smmarchive.store, нажмите «Привязать Telegram» и отправьте сюда 6-значный код.');
+}));
+app.post('/api/telegram/code', auth, authLimit, wrap(async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) return bad(res, 'Telegram-бот пока не подключён', 503);
+  const code = String(crypto.randomInt(100000, 1000000));
+  await db.query('update users set tg_code=$1 where id=$2', [code, req.user.id]);
+  res.json({ success: true, code, bot: TELEGRAM_BOT_USERNAME });
+}));
+app.post('/api/telegram/unlink', auth, wrap(async (req, res) => { await db.query('update users set tg_id=null, is_tg_verified=0, tg_code=null where id=$1', [req.user.id]); res.json({ success: true }); }));
+app.get('/api/admin/telegram/stats', admin, wrap(async (_q, res) => res.json({ success: true, linked: Number((await db.query('select count(*) from users where is_tg_verified=1')).rows[0].count), configured: !!TELEGRAM_BOT_TOKEN })));
+const bcLimit = rateLimit({ windowMs: 60 * 1000, max: 5 });
+app.post('/api/admin/broadcast', admin, bcLimit, wrap(async (req, res) => {
+  if (!TELEGRAM_BOT_TOKEN) return bad(res, 'Telegram-бот пока не подключён', 503);
+  const text = String(req.body.text || '').trim(); if (!text) return bad(res, 'Введите текст');
+  if (text.length > 3500) return bad(res, 'Слишком длинный текст (до 3500 символов)');
+  const login = String(req.body.login || '').trim();
+  const r = login ? await db.query('select id,tg_id from users where lower(login)=lower($1) and is_tg_verified=1 and tg_id is not null', [login])
+    : await db.query('select id,tg_id from users where is_tg_verified=1 and tg_id is not null');
+  if (!r.rows.length) return bad(res, login ? 'У этого пользователя не привязан Telegram' : 'Нет клиентов с привязанным Telegram');
+  let sent = 0, failed = 0;
+  for (const u of r.rows) {
+    const d = await tgSend(u.tg_id, text);
+    if (d.ok) sent++; else { failed++; if (d.error_code === 403) await db.query('update users set tg_id=null, is_tg_verified=0 where id=$1', [u.id]); } // человек заблокировал бота
+    await new Promise(z => setTimeout(z, 50)); // лимит Telegram: не чаще ~20 сообщений в секунду
+  }
+  res.json({ success: true, sent, failed, total: r.rows.length });
+}));
+
 app.post('/api/auth/forgot', authLimit, wrap(async (req, res) => {
   const email = String(req.body.email || '').trim();
   const r = await db.query('select id from users where lower(email)=lower($1) and is_email_verified=true', [email]);
@@ -152,6 +206,8 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
       values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) returning id`,
       [req.user.id, JSON.stringify(lines), final, discount, code, status, method, delivery_method || null, address, name, phone]);
     await cl.query('commit');
+    tgNotifyUser(req.user.id, `Заказ №${o.rows[0].id} оформлен. Сумма: ${final} ₽. Статус: ${status}.`);
+    tgNotifyAdmins(`Новый заказ №${o.rows[0].id}: ${final} ₽, ${name}, ${phone}. Статус: ${status}.`);
     res.json({ success: true, orderId: o.rows[0].id, total: final, status, payUrl: null }); // payUrl появится при подключении кассы
   } catch (e) { await cl.query('rollback'); throw e; } finally { cl.release(); }
 }));
@@ -221,11 +277,26 @@ app.patch('/api/admin/orders/:id', admin, wrap(async (req, res) => {
   const ok = ['Ожидает оплаты', 'Оплачен', 'В пути', 'Доставлен', 'Отменён'];
   if (req.body.status && !ok.includes(req.body.status)) return bad(res, 'Неверный статус');
   await db.query('update orders set status=coalesce($1,status), track_number=coalesce($2,track_number) where id=$3', [req.body.status || null, req.body.track_number || null, id]);
+  if (req.body.status || req.body.track_number) {
+    const o = (await db.query('select user_id,status,track_number from orders where id=$1', [id])).rows[0];
+    if (o) tgNotifyUser(o.user_id, `Заказ №${id}: статус «${o.status}».` + (o.track_number ? ` Трек-номер: ${o.track_number}` : ''));
+  }
   res.json({ success: true });
 }));
 app.get('/api/admin/users/search', admin, wrap(async (req, res) => {
   const q = `%${String(req.query.q || '').trim()}%`;
-  res.json((await db.query('select id,login,email,balance from users where login ilike $1 or email ilike $1 order by id limit 10', [q])).rows);
+  res.json((await db.query('select id,login,email,balance,is_admin from users where login ilike $1 or email ilike $1 order by id limit 10', [q])).rows);
+}));
+app.post('/api/admin/users/:id/admin', admin, wrap(async (req, res) => {
+  const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
+  const me = (await db.query('select login from users where id=$1', [req.user.id])).rows[0];
+  if (!me || !ADMIN_LOGIN || me.login.toLowerCase() !== ADMIN_LOGIN.toLowerCase()) return bad(res, 'Назначать админов может только главный администратор', 403);
+  const t = (await db.query('select login,is_email_verified from users where id=$1', [id])).rows[0];
+  if (!t) return bad(res, 'Пользователь не найден', 404);
+  if (t.login.toLowerCase() === ADMIN_LOGIN.toLowerCase()) return bad(res, 'Права главного администратора менять нельзя');
+  if (req.body.value && !t.is_email_verified) return bad(res, 'Почта пользователя не подтверждена');
+  await db.query('update users set is_admin=$1 where id=$2', [req.body.value ? 1 : 0, id]);
+  res.json({ success: true, is_admin: req.body.value ? 1 : 0 });
 }));
 app.post('/api/admin/users/:id/balance', admin, wrap(async (req, res) => {
   const id = toId(req.params.id), amount = Number(req.body.amount);
@@ -253,5 +324,5 @@ async function seedAdmin() {
     [ADMIN_LOGIN, ADMIN_EMAIL, await bcrypt.hash(ADMIN_PASSWORD, 10), crypto.randomBytes(4).toString('hex').toUpperCase()]);
   console.log('Админ готов:', ADMIN_LOGIN);
 }
-db.query('select 1').then(seedAdmin).then(() => app.listen(PORT, () => console.log('Server started on port', PORT)))
+db.query('select 1').then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
