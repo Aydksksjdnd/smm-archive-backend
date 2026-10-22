@@ -10,6 +10,10 @@ if (!DATABASE_URL || !JWT_SECRET || JWT_SECRET.length < 32) throw new Error('Н�
 
 const db = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+// Почта: если заданы GMAIL_USER и GMAIL_APP_PASSWORD, письма идут через Gmail (SMTP, нужен платный Render), иначе через Resend
+const { GMAIL_USER, GMAIL_APP_PASSWORD } = process.env;
+const gmail = GMAIL_USER && GMAIL_APP_PASSWORD ? require('nodemailer').createTransport({ host: 'smtp.gmail.com', port: 465, secure: true,
+  auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD }, connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000 }) : null;
 const app = express();
 app.set('trust proxy', 1);
 app.use(cors({ origin: FRONTEND_ORIGIN.split(',').map(s => s.trim()), credentials: true }));
@@ -33,6 +37,7 @@ const admin = (req, res, next) => auth(req, res, async () => {
 });
 
 async function sendMail(to, subject, html) {
+  if (gmail) { await gmail.sendMail({ from: `SMM Archive <${GMAIL_USER}>`, to, subject, html }); return; }
   if (!resend) throw new Error('Почта не настроена');
   const { error } = await resend.emails.send({ from: MAIL_FROM, to, subject, html });
   if (error) throw new Error(error.message);
@@ -61,6 +66,26 @@ app.post('/api/auth/verify', authLimit, wrap(async (req, res) => {
   if (!u || !u.email_code || u.email_code !== String(code) || new Date(u.email_code_expires) < new Date()) return bad(res, 'Неверный или просроченный код');
   await db.query('update users set is_email_verified=true, email_code=null, email_code_expires=null where id=$1', [u.id]);
   res.json(out(u));
+}));
+
+app.post('/api/auth/forgot', authLimit, wrap(async (req, res) => {
+  const email = String(req.body.email || '').trim();
+  const r = await db.query('select id from users where lower(email)=lower($1) and is_email_verified=true', [email]);
+  if (r.rows[0]) {
+    const code = String(crypto.randomInt(100000, 1000000));
+    await db.query(`update users set email_code=$1, email_code_expires=now()+interval '15 minutes' where id=$2`, [code, r.rows[0].id]);
+    await sendMail(email, 'Восстановление пароля SMM Archive', `<p>Код для смены пароля: <b style="font-size:22px">${code}</b></p><p>Он действует 15 минут. Если это были не вы, просто проигнорируйте письмо.</p>`);
+  }
+  res.json({ success: true, message: 'Если такая почта зарегистрирована, мы отправили на неё код' }); // одинаковый ответ, чтобы нельзя было угадывать почты
+}));
+app.post('/api/auth/reset', authLimit, wrap(async (req, res) => {
+  const { email, code, password } = req.body;
+  if ((password || '').length < 8) return bad(res, 'Пароль от 8 символов');
+  const r = await db.query('select * from users where lower(email)=lower($1)', [String(email || '')]);
+  const u = r.rows[0];
+  if (!u || !u.email_code || u.email_code !== String(code) || new Date(u.email_code_expires) < new Date()) return bad(res, 'Неверный или просроченный код');
+  await db.query('update users set password_hash=$1, email_code=null, email_code_expires=null where id=$2', [await bcrypt.hash(password, 10), u.id]);
+  res.json({ success: true, message: 'Пароль изменён, теперь войдите' });
 }));
 
 app.post('/api/auth/login', authLimit, wrap(async (req, res) => {
@@ -102,7 +127,7 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
   const pr = (await db.query('select id,title,price from products where id=any($1)', [ids])).rows;
   let total = 0; const lines = [];
   for (const i of items) {
-    const p = pr.find(x => Number(x.id) === toId(i.id)), q = parseInt(i.qty); // Number(): pg отдаёт bigint строкой
+    const p = pr.find(x => x.id === toId(i.id)), q = parseInt(i.qty);
     if (!p || !(q > 0 && q <= 20)) return bad(res, 'Товар не найден или неверное количество');
     lines.push({ id: p.id, title: p.title, size: String(i.size || '').slice(0, 10), qty: q, price: Number(p.price) });
     total += Number(p.price) * q;
@@ -144,6 +169,30 @@ app.post('/api/admin/products', admin, wrap(async (req, res) => {
 app.delete('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
   await db.query('delete from products where id=$1', [id]); res.json({ success: true });
+}));
+app.patch('/api/admin/products/:id', admin, wrap(async (req, res) => {
+  const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
+  const { title, category, price, description, badge, photos, sizes } = req.body;
+  if (!title || !(Number(price) > 0)) return bad(res, 'Укажите название и цену');
+  const r = await db.query('update products set title=$1,category=$2,price=$3,description=$4,badge=$5,photos=$6,sizes=$7 where id=$8',
+    [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), id]);
+  r.rowCount ? res.json({ success: true }) : bad(res, 'Товар не найден', 404);
+}));
+const aiLimit = rateLimit({ windowMs: 60 * 1000, max: 8 });
+app.post('/api/admin/ai-describe', admin, aiLimit, wrap(async (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return bad(res, 'ИИ не подключён: добавьте ANTHROPIC_API_KEY в настройки Render', 503);
+  const content = cleanImgs(req.body.photos).slice(0, 3).map(p => { const m = /^data:(image\/(?:jpeg|png|webp|gif));base64,(.+)$/.exec(p); return m && { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }; }).filter(Boolean);
+  if (!content.length) return bad(res, 'Сначала загрузите фото');
+  content.push({ type: 'text', text: `Ты копирайтер магазина архивного streetwear SMM Archive. Название: «${String(req.body.title || '').slice(0, 100)}», раздел: ${String(req.body.category || '').slice(0, 30)}. По фотографиям напиши описание для карточки товара на русском: цвет и заметные детали, что видно по исполнению (швы, фурнитура, подошва, принт), чем интересна именно эта вещь, затем 3–4 коротких совета по уходу для такого типа вещи. Состав ткани, бренд, год и размер указывай только если это видно на фото, иначе не выдумывай. 120–180 слов, без эмодзи и markdown, обычным текстом абзацами.` });
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5', max_tokens: 700, messages: [{ role: 'user', content }] })
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { console.error('AI error', r.status, JSON.stringify(d).slice(0, 300)); return bad(res, 'ИИ сейчас недоступен: ' + ((d.error && d.error.message) || r.status), 502); }
+  const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+  text ? res.json({ success: true, description: text }) : bad(res, 'ИИ вернул пустой ответ', 502);
 }));
 app.post('/api/admin/news', admin, wrap(async (req, res) => {
   const { title, text, photo } = req.body;
