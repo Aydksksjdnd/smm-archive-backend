@@ -157,7 +157,8 @@ app.get('/api/auth/profile', auth, wrap(async (req, res) => {
 }));
 
 // ---------- Публичные данные ----------
-app.get('/api/products', wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows)));
+app.get('/api/products', wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows.map(({ supplier_url, ...p }) => p)))); // ссылка поставщика покупателям не отдаётся
+app.get('/api/admin/products', admin, wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows))); // для админки: вместе со ссылкой поставщика
 app.get('/api/news', wrap(async (_q, res) => res.json((await db.query('select * from news order by id desc limit 50')).rows)));
 app.get('/api/reviews', wrap(async (_q, res) => res.json((await db.query('select id,name,rating,comment,created_at from reviews where approved order by id desc limit 50')).rows)));
 app.post('/api/reviews', auth, wrap(async (req, res) => {
@@ -213,14 +214,37 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
 }));
 app.get('/api/orders/my', auth, wrap(async (req, res) => res.json((await db.query('select * from orders where user_id=$1 order by id desc', [req.user.id])).rows)));
 
+// ---------- Отчёты о загрузке товаров в Telegram-группу ----------
+const { TELEGRAM_REPORT_CHAT_ID, TELEGRAM_REPORT_BOT_TOKEN, REPORT_TZ = 'Europe/Moscow' } = process.env;
+const CAT_RU = { jackets: 'Куртки', bombers: 'Бомберы', longsleeve: 'Лонгсливы', tshirt: 'Футболки', pants: 'Штаны', shoes: 'Обувь', bags: 'Сумки', accessories: 'Аксессуары', set: 'Сет одежды', other: 'Другое' };
+const h = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const cleanUrl = v => { const u = String(v || '').trim().slice(0, 1000); return /^https?:\/\//i.test(u) ? u : null; };
+async function sendProductReport(action, adminId, product) {
+  try {
+    const token = TELEGRAM_REPORT_BOT_TOKEN || TELEGRAM_BOT_TOKEN;
+    if (!token || !TELEGRAM_REPORT_CHAT_ID) return console.log('Отчёт не отправлен: нет TELEGRAM_REPORT_CHAT_ID');
+    const who = (await db.query('select login from users where id=$1', [adminId])).rows[0]?.login || ('id ' + adminId);
+    const date = new Date().toLocaleString('ru-RU', { timeZone: REPORT_TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    let sizes = product.sizes; try { if (typeof sizes === 'string') sizes = JSON.parse(sizes); } catch {}
+    const text = [action === 'create' ? '📦 <b>Новый товар загружен</b>' : '✏️ <b>Товар изменён</b>',
+      `📅 Дата: ${h(date)}`, `👤 Админ: ${h(who)}`, `🏷 Название: ${h(product.title)}`,
+      `📂 Категория: ${h(CAT_RU[product.category] || product.category)}`, `📐 Размеры: ${h(Array.isArray(sizes) ? sizes.join(', ') : sizes || '—')}`,
+      `💰 Цена: ${h(Number(product.price).toLocaleString('ru-RU'))} ₽`, `🔗 Поставщик: ${product.supplier_url ? h(product.supplier_url) : 'не указана'}`].join('\n');
+    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: TELEGRAM_REPORT_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true }) }).then(x => x.json());
+    if (!r.ok) console.error('Отчёт Telegram:', r.description);
+  } catch (e) { console.error('sendProductReport', e.message); } // сбой отчёта не должен ломать загрузку товара
+}
+
 // ---------- Админка ----------
 const cleanImgs = a => (Array.isArray(a) ? a : []).filter(s => typeof s === 'string' && /^(data:image\/|https:\/\/)/.test(s)).slice(0, 8);
 app.post('/api/admin/products', admin, wrap(async (req, res) => {
-  const { title, category, price, description, badge, photos, sizes } = req.body;
+  const { title, category, price, description, badge, photos, sizes, supplier_url } = req.body;
   if (!title || !(Number(price) > 0)) return bad(res, 'Укажите название и цену');
-  const r = await db.query('insert into products(title,category,price,description,badge,photos,sizes) values($1,$2,$3,$4,$5,$6,$7) returning *',
-    [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15))]);
-  res.json({ success: true, product: r.rows[0] });
+  const r = await db.query('insert into products(title,category,price,description,badge,photos,sizes,supplier_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *',
+    [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url)]);
+  sendProductReport('create', req.user.id, r.rows[0]); // без await: ответ админу не ждёт Telegram
+  const { supplier_url: _s, ...pub } = r.rows[0]; res.json({ success: true, product: pub });
 }));
 app.delete('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
@@ -228,11 +252,13 @@ app.delete('/api/admin/products/:id', admin, wrap(async (req, res) => {
 }));
 app.patch('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
-  const { title, category, price, description, badge, photos, sizes } = req.body;
+  const { title, category, price, description, badge, photos, sizes, supplier_url } = req.body;
   if (!title || !(Number(price) > 0)) return bad(res, 'Укажите название и цену');
-  const r = await db.query('update products set title=$1,category=$2,price=$3,description=$4,badge=$5,photos=$6,sizes=$7 where id=$8',
-    [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), id]);
-  r.rowCount ? res.json({ success: true }) : bad(res, 'Товар не найден', 404);
+  const r = await db.query('update products set title=$1,category=$2,price=$3,description=$4,badge=$5,photos=$6,sizes=$7,supplier_url=$8 where id=$9 returning *',
+    [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url), id]);
+  if (!r.rowCount) return bad(res, 'Товар не найден', 404);
+  sendProductReport('update', req.user.id, r.rows[0]);
+  res.json({ success: true });
 }));
 const aiLimit = rateLimit({ windowMs: 60 * 1000, max: 8 });
 app.post('/api/admin/ai-describe', admin, aiLimit, wrap(async (req, res) => {
@@ -324,5 +350,5 @@ async function seedAdmin() {
     [ADMIN_LOGIN, ADMIN_EMAIL, await bcrypt.hash(ADMIN_PASSWORD, 10), crypto.randomBytes(4).toString('hex').toUpperCase()]);
   console.log('Админ готов:', ADMIN_LOGIN);
 }
-db.query('select 1').then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
+db.query('alter table products add column if not exists supplier_url text').then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
