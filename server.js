@@ -20,7 +20,7 @@ app.use(cors({ origin: FRONTEND_ORIGIN.split(',').map(s => s.trim()), credential
 app.use(express.json({ limit: '12mb' }));
 
 const authLimit = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
-const wrap = fn => (req, res) => fn(req, res).catch(e => { console.error(e); res.status(500).json({ success: false, message: 'Ошибка сервера' }); });
+const wrap = fn => (req, res) => fn(req, res).catch(e => { console.error(e); if (!res.headersSent) res.status(500).json({ success: false, message: 'Ошибка сервера' }); });
 const bad = (res, message, code = 400) => res.status(code).json({ success: false, message });
 const toId = v => { const n = Number(v); return Number.isSafeInteger(n) && n > 0 && n <= 2147483647 ? n : null; }; // защита от ошибки 22003
 const sign = u => jwt.sign({ id: u.id }, JWT_SECRET, { expiresIn: '7d' });
@@ -122,6 +122,45 @@ app.post('/api/admin/broadcast', admin, bcLimit, wrap(async (req, res) => {
   res.json({ success: true, sent, failed, total: r.rows.length });
 }));
 
+// ===== ЮKassa: оплата картой/СБП =====
+const { YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY } = process.env;
+const yk = async (method, path, body, idem) => {
+  try { return await ykCall(method, path, body, idem); } catch (e) { return { ok: false, d: { description: 'нет связи с ЮKassa' } }; }
+};
+const ykCall = async (method, path, body, idem) => {
+  const r = await fetch('https://api.yookassa.ru/v3' + path, { method, headers: { 'content-type': 'application/json',
+    authorization: 'Basic ' + Buffer.from(YOOKASSA_SHOP_ID + ':' + YOOKASSA_SECRET_KEY).toString('base64'), ...(idem ? { 'Idempotence-Key': idem } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  return { ok: r.ok, d: await r.json().catch(() => ({})) };
+};
+// Статус платежа берём только у самой ЮKassa (а не из присланного запроса), и сверяем сумму
+async function ykSettle(paymentId) {
+  const { ok, d } = await yk('GET', '/payments/' + encodeURIComponent(paymentId));
+  if (!ok) return null;
+  const o = (await db.query('select id,user_id,total,status from orders where payment_id=$1', [paymentId])).rows[0];
+  if (!o) return null;
+  if (d.status === 'succeeded' && d.paid) {
+    if (!d.amount || d.amount.currency !== 'RUB' || Math.abs(Number(d.amount.value) - Number(o.total)) > 0.005) { console.error('ЮKassa: сумма не совпала, заказ', o.id); return o.status; }
+    const u = await db.query(`update orders set status='Оплачен' where id=$1 and status='Ожидает оплаты'`, [o.id]);
+    if (u.rowCount) { tgNotifyUser(o.user_id, `Заказ №${o.id} оплачен. Спасибо!`); tgNotifyAdmins(`Заказ №${o.id} оплачен через ЮKassa: ${o.total} ₽.`); }
+    return 'Оплачен';
+  }
+  if (d.status === 'canceled') { await db.query(`update orders set status='Отменён' where id=$1 and status='Ожидает оплаты'`, [o.id]); return 'Отменён'; }
+  return o.status;
+}
+app.post('/api/yookassa/webhook', wrap(async (req, res) => {
+  res.sendStatus(200);
+  const o = req.body && req.body.object;
+  if (o && o.id && /^payment\./.test(String(req.body.event))) await ykSettle(String(o.id));
+}));
+app.get('/api/orders/:id/check', auth, wrap(async (req, res) => {
+  const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
+  const o = (await db.query('select status,payment_id from orders where id=$1 and user_id=$2', [id, req.user.id])).rows[0];
+  if (!o) return bad(res, 'Заказ не найден', 404);
+  let status = o.status;
+  if (status === 'Ожидает оплаты' && o.payment_id) status = (await ykSettle(o.payment_id)) || status;
+  res.json({ success: true, status });
+}));
+
 app.post('/api/auth/forgot', authLimit, wrap(async (req, res) => {
   const email = String(req.body.email || '').trim();
   const r = await db.query('select id from users where lower(email)=lower($1) and is_email_verified=true', [email]);
@@ -209,7 +248,18 @@ app.post('/api/orders', auth, wrap(async (req, res) => {
     await cl.query('commit');
     tgNotifyUser(req.user.id, `Заказ №${o.rows[0].id} оформлен. Сумма: ${final} ₽. Статус: ${status}.`);
     tgNotifyAdmins(`Новый заказ №${o.rows[0].id}: ${final} ₽, ${name}, ${phone}. Статус: ${status}.`);
-    res.json({ success: true, orderId: o.rows[0].id, total: final, status, payUrl: null }); // payUrl появится при подключении кассы
+    let payUrl = null; const oid = o.rows[0].id;
+    if (method === 'yoomoney') {
+      const fail = async msg => { await db.query(`update orders set status='Отменён' where id=$1`, [oid]); return bad(res, msg, 502); };
+      if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) return fail('Онлайн-оплата пока не подключена');
+      const base = FRONTEND_ORIGIN.split(',')[0].trim();
+      const p = await yk('POST', '/payments', { amount: { value: final.toFixed(2), currency: 'RUB' }, capture: true,
+        confirmation: { type: 'redirect', return_url: `${base}/profile.html?paid=${oid}` }, description: `Заказ №${oid} SMM Archive`, metadata: { order_id: String(oid) } }, `order-${oid}`);
+      if (!p.ok || !p.d.confirmation) { console.error('ЮKassa ошибка:', JSON.stringify(p.d).slice(0, 500)); return fail('Не удалось создать платёж: ' + (p.d.description || 'ошибка ЮKassa')); }
+      await db.query('update orders set payment_id=$1 where id=$2', [p.d.id, oid]);
+      payUrl = p.d.confirmation.confirmation_url;
+    }
+    res.json({ success: true, orderId: oid, total: final, status, payUrl });
   } catch (e) { await cl.query('rollback'); throw e; } finally { cl.release(); }
 }));
 app.get('/api/orders/my', auth, wrap(async (req, res) => res.json((await db.query('select * from orders where user_id=$1 order by id desc', [req.user.id])).rows)));
@@ -350,5 +400,5 @@ async function seedAdmin() {
     [ADMIN_LOGIN, ADMIN_EMAIL, await bcrypt.hash(ADMIN_PASSWORD, 10), crypto.randomBytes(4).toString('hex').toUpperCase()]);
   console.log('Админ готов:', ADMIN_LOGIN);
 }
-db.query('alter table products add column if not exists supplier_url text').then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
+db.query('alter table products add column if not exists supplier_url text').then(() => db.query('alter table orders add column if not exists payment_id text')).then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
