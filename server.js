@@ -346,6 +346,54 @@ async function sendProductReport(action, adminId, product) {
   } catch (e) { console.error('sendProductReport', e.message); } // сбой отчёта не должен ломать загрузку товара
 }
 
+// ---------- Журнал действий админов и отчёт «за сегодня» ----------
+const logAct = (adminId, action, details) => db.query('insert into admin_log(admin_id,action,details) values($1,$2,$3)', [adminId, action, JSON.stringify(details || {})]).catch(e => console.error('admin_log', e.message));
+const ROLE_NOM = { main: 'Главный администратор', adm: 'Администратор', user: 'Пользователь' };
+const ROLE_DAT = { main: 'Главному администратору', adm: 'Администратору', user: 'пользователю' };
+const roleOf = (login, isAdm) => ADMIN_LOGIN && String(login || '').toLowerCase() === ADMIN_LOGIN.toLowerCase() ? 'main' : (isAdm === 1 || isAdm === true ? 'adm' : 'user');
+const nf = n => Number(n || 0).toLocaleString('ru-RU');
+const rub = n => { const a = Math.abs(Math.round(n)) % 100, b = a % 10; return nf(Math.abs(n)) + ' ' + (a > 10 && a < 15 ? 'рублей' : b === 1 ? 'рубль' : b > 1 && b < 5 ? 'рубля' : 'рублей'); };
+async function buildTodayReport() {
+  const today = c => `(${c} at time zone $1)::date = (now() at time zone $1)::date`; // «сегодня» по часовому поясу магазина
+  const q = (sql) => db.query(sql, [REPORT_TZ]).then(r => r.rows);
+  const [up, ord, act, nu, bal, top] = await Promise.all([
+    q(`select count(*)::int n from admin_log where action='product_create' and ${today('created_at')}`),
+    q(`select id,name,total,status,items from orders where ${today('created_at')} order by id`),
+    q(`select u.login, count(*)::int n from admin_log l join users u on u.id=l.admin_id where l.action in ('product_create','product_update') and ${today('l.created_at')} group by u.login order by n desc, u.login limit 3`),
+    q(`select count(*)::int n from users where is_email_verified and ${today('created_at')}`),
+    q(`select details from admin_log where action='balance' and ${today('created_at')} order by id`),
+    q(`select count(*)::int n, coalesce(sum(amount),0) s from topups where status='succeeded' and ${today('created_at')}`)
+  ]);
+  const paid = ord.filter(o => ['Оплачен', 'В пути', 'Доставлен'].includes(o.status));
+  let pcs = 0; for (const o of paid) { let it = o.items; try { if (typeof it === 'string') it = JSON.parse(it); } catch { it = []; } for (const i of (Array.isArray(it) ? it : [])) pcs += Number(i.qty) || 0; }
+  const date = new Date().toLocaleDateString('ru-RU', { timeZone: REPORT_TZ, day: '2-digit', month: '2-digit', year: 'numeric' });
+  const lines = [`📊 Статистика товаров за сегодня (${date})`,
+    `📦 Загружено товаров: ${up[0].n}`,
+    `💸 Продано: ${paid.length ? `${pcs} шт. на ${nf(paid.reduce((a, o) => a + Number(o.total), 0))} ₽ (заказов: ${paid.length})` : 0}`,
+    `🏆 Самые активные администраторы: ${act.length ? act.map(a => `${a.login} (${a.n})`).join(', ') : '—'}`,
+    `👥 Новых пользователей: ${nu[0].n}`,
+    `💰 Выдача баланса: ${bal.length ? bal.slice(-15).map(r => { const d = r.details || {}; return `${ROLE_NOM[d.fromRole] || 'Администратор'} ${d.from} ${d.amount < 0 ? 'списал' : 'выдал'} ${rub(d.amount)} ${ROLE_DAT[d.toRole] || 'пользователю'} ${d.to} на баланс ${nf(d.balance)}р`; }).join('; ') + ';' : 'нет'}`,
+    `🧾 Ордеры: ${ord.length ? ord.slice(-15).map(o => `№${o.id} ${o.name}, ${nf(o.total)} ₽, ${o.status}`).join('; ') : 0}`,
+    `🏦 Пополнения кассы: ${Number(top[0].n) ? `${top[0].n} на ${nf(top[0].s)} ₽` : 0}`];
+  const plain = lines.join('\n');
+  const html = `<b>${h(lines[0])}</b>\n` + lines.slice(1).map(h).join('\n');
+  return { plain, html };
+}
+async function sendToReportGroup(html) {
+  const token = TELEGRAM_REPORT_BOT_TOKEN || TELEGRAM_BOT_TOKEN;
+  if (!token || !TELEGRAM_REPORT_CHAT_ID) return { ok: false, error: 'Не задан TELEGRAM_REPORT_CHAT_ID или токен бота' };
+  const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id: TELEGRAM_REPORT_CHAT_ID, text: html.slice(0, 4000), parse_mode: 'HTML', disable_web_page_preview: true }) }).then(x => x.json()).catch(e => ({ ok: false, description: String(e) }));
+  return { ok: !!r.ok, error: r.ok ? null : r.description };
+}
+const reportLimit = rateLimit({ windowMs: 60 * 1000, max: 5 });
+app.post('/api/admin/report/today', admin, reportLimit, wrap(async (_q, res) => {
+  const { plain, html } = await buildTodayReport();
+  const r = await sendToReportGroup(html);
+  if (!r.ok) console.error('Отчёт за сегодня не отправлен:', r.error);
+  res.json({ success: true, sent: r.ok, error: r.error, text: plain });
+}));
+
 // ---------- Админка ----------
 const cleanImgs = a => (Array.isArray(a) ? a : []).filter(s => typeof s === 'string' && /^(data:image\/|https:\/\/)/.test(s)).slice(0, 8);
 app.post('/api/admin/products', admin, wrap(async (req, res) => {
@@ -354,6 +402,7 @@ app.post('/api/admin/products', admin, wrap(async (req, res) => {
   const r = await db.query('insert into products(title,category,price,description,badge,photos,sizes,supplier_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *',
     [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url)]);
   sendProductReport('create', req.user.id, r.rows[0]); // без await: ответ админу не ждёт Telegram
+  logAct(req.user.id, 'product_create', { id: r.rows[0].id, title: r.rows[0].title });
   const { supplier_url: _s, ...pub } = r.rows[0]; res.json({ success: true, product: pub });
 }));
 app.delete('/api/admin/products/:id', admin, wrap(async (req, res) => {
@@ -368,6 +417,7 @@ app.patch('/api/admin/products/:id', admin, wrap(async (req, res) => {
     [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url), id]);
   if (!r.rowCount) return bad(res, 'Товар не найден', 404);
   sendProductReport('update', req.user.id, r.rows[0]);
+  logAct(req.user.id, 'product_update', { id, title: r.rows[0].title });
   res.json({ success: true });
 }));
 const aiLimit = rateLimit({ windowMs: 60 * 1000, max: 8 });
@@ -437,8 +487,11 @@ app.post('/api/admin/users/:id/admin', admin, wrap(async (req, res) => {
 app.post('/api/admin/users/:id/balance', admin, wrap(async (req, res) => {
   const id = toId(req.params.id), amount = Number(req.body.amount);
   if (!id || !Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 1e6) return bad(res, 'Неверный ID или сумма');
-  const r = await db.query('update users set balance=balance+$1 where id=$2 and balance+$1>=0 returning balance', [amount, id]);
-  r.rowCount ? res.json({ success: true, balance: Number(r.rows[0].balance) }) : bad(res, 'Пользователь не найден или баланс уйдёт в минус');
+  const r = await db.query('update users set balance=balance+$1 where id=$2 and balance+$1>=0 returning balance,login,is_admin', [amount, id]);
+  if (!r.rowCount) return bad(res, 'Пользователь не найден или баланс уйдёт в минус');
+  const me = (await db.query('select login,is_admin from users where id=$1', [req.user.id])).rows[0] || {};
+  logAct(req.user.id, 'balance', { from: me.login, fromRole: roleOf(me.login, me.is_admin), to: r.rows[0].login, toRole: roleOf(r.rows[0].login, r.rows[0].is_admin), amount, balance: Number(r.rows[0].balance) });
+  res.json({ success: true, balance: Number(r.rows[0].balance) });
 }));
 app.get('/api/admin/reviews', admin, wrap(async (_q, res) => res.json((await db.query('select * from reviews order by id desc limit 100')).rows)));
 app.patch('/api/admin/reviews/:id', admin, wrap(async (req, res) => {
@@ -462,6 +515,9 @@ async function seedAdmin() {
 }
 db.query('alter table products add column if not exists supplier_url text').then(() => db.query('alter table orders add column if not exists payment_id text'))
   .then(() => db.query('alter table users add column if not exists avatar text'))
+  .then(() => db.query('alter table users add column if not exists created_at timestamptz')) // у старых пользователей останется пусто, чтобы они не попали в «новых за сегодня»
+  .then(() => db.query('alter table users alter column created_at set default now()'))
+  .then(() => db.query(`create table if not exists admin_log(id serial primary key, admin_id int, action text not null, details jsonb default '{}', created_at timestamptz default now())`))
   .then(() => db.query(`create table if not exists topups(id serial primary key, user_id int not null references users(id) on delete cascade, amount numeric(12,2) not null,
     payment_id text, status text not null default 'pending', created_at timestamptz default now())`)).then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
