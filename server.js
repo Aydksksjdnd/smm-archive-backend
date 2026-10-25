@@ -252,10 +252,39 @@ app.get('/api/auth/profile', auth, wrap(async (req, res) => {
 }));
 
 // ---------- Публичные данные ----------
-app.get('/api/products', wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows.map(({ supplier_url, ...p }) => p)))); // ссылка поставщика покупателям не отдаётся
+// Фото лежат в базе как base64. Раньше весь этот текст уходил в списке товаров (мегабайты) — каталог грузился 10–15 секунд.
+// Теперь список лёгкий, а каждое фото отдаётся отдельной ссылкой, которую браузер кэширует на год.
+const asArr = v => { if (Array.isArray(v)) return v; try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { return []; } };
+const imgVer = s => crypto.createHash('md5').update(s.length + s.slice(-200)).digest('hex').slice(0, 8);
+const absUrl = (req, u) => typeof u === 'string' && u.startsWith('/api/') ? `${req.protocol}://${req.get('host')}${u}` : u;
+let pubProducts = null; const dropPubCache = () => { pubProducts = null; };
+async function publicProducts() {
+  if (pubProducts && Date.now() - pubProducts.at < 300000) return pubProducts.rows; // кэш в памяти, сбрасывается при любом изменении товаров
+  const rows = (await db.query('select * from products order by id desc')).rows.map(({ supplier_url, photos, ...p }) => // ссылка поставщика покупателям не отдаётся
+    ({ ...p, photos: asArr(photos).map((ph, i) => typeof ph === 'string' && ph.startsWith('data:') ? `/api/products/${p.id}/photo/${i}?v=${imgVer(ph)}` : ph) }));
+  pubProducts = { at: Date.now(), rows }; return rows;
+}
+function sendDataUrl(res, dataUrl) {
+  const m = /^data:(image\/[a-z+.-]+);base64,(.+)$/i.exec(dataUrl || '');
+  if (!m) return res.status(404).end();
+  res.set({ 'Content-Type': m[1], 'Cache-Control': 'public, max-age=31536000, immutable', 'Cross-Origin-Resource-Policy': 'cross-origin' });
+  res.send(Buffer.from(m[2], 'base64'));
+}
+app.get('/api/health', (_q, res) => res.json({ ok: true })); // лёгкий адрес для «будильника» сервера
+app.get('/api/products', wrap(async (req, res) => res.json((await publicProducts()).map(p => ({ ...p, photos: p.photos.map(u => absUrl(req, u)) })))));
+app.get('/api/products/:id/photo/:n', wrap(async (req, res) => {
+  const id = toId(req.params.id), n = parseInt(req.params.n); if (!id || !(n >= 0 && n < 8)) return res.status(404).end();
+  const r = (await db.query('select photos from products where id=$1', [id])).rows[0]; if (!r) return res.status(404).end();
+  sendDataUrl(res, asArr(r.photos)[n]);
+}));
+app.get('/api/news/:id/photo', wrap(async (req, res) => {
+  const id = toId(req.params.id); if (!id) return res.status(404).end();
+  const r = (await db.query('select photo from news where id=$1', [id])).rows[0]; if (!r) return res.status(404).end();
+  sendDataUrl(res, r.photo);
+}));
 app.get('/api/admin/products', admin, wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows))); // для админки: вместе со ссылкой поставщика
 app.get('/api/categories', (_q, res) => res.json(Object.entries(CAT_RU).map(([id, name]) => ({ id, name })))); // единый список разделов для сайта и админки
-app.get('/api/news', wrap(async (_q, res) => res.json((await db.query('select * from news order by id desc limit 50')).rows)));
+app.get('/api/news', wrap(async (req, res) => res.json((await db.query('select * from news order by id desc limit 50')).rows.map(n => typeof n.photo === 'string' && n.photo.startsWith('data:') ? { ...n, photo: absUrl(req, `/api/news/${n.id}/photo?v=${imgVer(n.photo)}`) } : n))));
 app.get('/api/reviews', wrap(async (_q, res) => res.json((await db.query('select id,name,rating,comment,created_at from reviews where approved order by id desc limit 50')).rows)));
 app.post('/api/reviews', auth, wrap(async (req, res) => {
   const rating = parseInt(req.body.rating), comment = String(req.body.comment || '').trim().slice(0, 1000);
@@ -401,13 +430,14 @@ app.post('/api/admin/products', admin, wrap(async (req, res) => {
   if (!title || !(Number(price) > 0)) return bad(res, 'Укажите название и цену');
   const r = await db.query('insert into products(title,category,price,description,badge,photos,sizes,supplier_url) values($1,$2,$3,$4,$5,$6,$7,$8) returning *',
     [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url)]);
+  dropPubCache();
   sendProductReport('create', req.user.id, r.rows[0]); // без await: ответ админу не ждёт Telegram
   logAct(req.user.id, 'product_create', { id: r.rows[0].id, title: r.rows[0].title });
   const { supplier_url: _s, ...pub } = r.rows[0]; res.json({ success: true, product: pub });
 }));
 app.delete('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
-  await db.query('delete from products where id=$1', [id]); res.json({ success: true });
+  await db.query('delete from products where id=$1', [id]); dropPubCache(); res.json({ success: true });
 }));
 app.patch('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
@@ -416,6 +446,7 @@ app.patch('/api/admin/products/:id', admin, wrap(async (req, res) => {
   const r = await db.query('update products set title=$1,category=$2,price=$3,description=$4,badge=$5,photos=$6,sizes=$7,supplier_url=$8 where id=$9 returning *',
     [title, category || 'other', Number(price), description || '', badge || null, JSON.stringify(cleanImgs(photos)), JSON.stringify((Array.isArray(sizes) ? sizes : []).map(String).slice(0, 15)), cleanUrl(supplier_url), id]);
   if (!r.rowCount) return bad(res, 'Товар не найден', 404);
+  dropPubCache();
   sendProductReport('update', req.user.id, r.rows[0]);
   logAct(req.user.id, 'product_update', { id, title: r.rows[0].title });
   res.json({ success: true });
@@ -521,3 +552,4 @@ db.query('alter table products add column if not exists supplier_url text').then
   .then(() => db.query(`create table if not exists topups(id serial primary key, user_id int not null references users(id) on delete cascade, amount numeric(12,2) not null,
     payment_id text, status text not null default 'pending', created_at timestamptz default now())`)).then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
+setTimeout(() => publicProducts().catch(() => {}), 3000); // прогреваем кэш каталога сразу после запуска
