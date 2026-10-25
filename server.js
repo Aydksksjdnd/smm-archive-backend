@@ -183,7 +183,7 @@ app.get('/api/orders/:id/check', auth, wrap(async (req, res) => {
 // ===== Пополнение баланса через ЮKassa =====
 app.post('/api/balance/topup', auth, wrap(async (req, res) => {
   const amount = Math.round(Number(req.body.amount) * 100) / 100;
-  if (!Number.isFinite(amount) || amount < 100 || amount > 100000) return bad(res, 'Сумма пополнения от 100 до 100 000 ₽');
+  if (!Number.isFinite(amount) || amount < 20 || amount > 10000) return bad(res, 'Сумма пополнения от 20 до 10 000 ₽');
   if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) return bad(res, 'Онлайн-оплата пока не подключена', 502);
   const tid = (await db.query('insert into topups(user_id,amount) values($1,$2) returning id', [req.user.id, amount])).rows[0].id;
   const base = FRONTEND_ORIGIN.split(',')[0].trim();
