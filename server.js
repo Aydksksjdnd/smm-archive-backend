@@ -25,7 +25,7 @@ const bad = (res, message, code = 400) => res.status(code).json({ success: false
 const toId = v => { const n = Number(v); return Number.isSafeInteger(n) && n > 0 && n <= 2147483647 ? n : null; }; // защита от ошибки 22003
 const sign = u => jwt.sign({ id: u.id }, JWT_SECRET, { expiresIn: '7d' });
 const out = u => ({ success: true, token: sign(u), userId: u.id, name: u.login, login: u.login, balance: Number(u.balance),
-  bonus_balance: Number(u.bonus_balance), referral_code: u.referral_code, is_admin: u.is_admin, is_tg_verified: u.is_tg_verified });
+  bonus_balance: Number(u.bonus_balance), referral_code: u.referral_code, is_admin: u.is_admin, is_tg_verified: u.is_tg_verified, avatar: u.avatar || null });
 
 const auth = (req, res, next) => {
   try { req.user = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET); next(); }
@@ -132,10 +132,29 @@ const ykCall = async (method, path, body, idem) => {
     authorization: 'Basic ' + Buffer.from(YOOKASSA_SHOP_ID + ':' + YOOKASSA_SECRET_KEY).toString('base64'), ...(idem ? { 'Idempotence-Key': idem } : {}) }, body: body ? JSON.stringify(body) : undefined });
   return { ok: r.ok, d: await r.json().catch(() => ({})) };
 };
+// Пополнение баланса: деньги зачисляются один раз, только после подтверждения от ЮKassa и с проверкой суммы
+async function settleTopup(t, d) {
+  if (d.status === 'succeeded' && d.paid) {
+    if (!d.amount || d.amount.currency !== 'RUB' || Math.abs(Number(d.amount.value) - Number(t.amount)) > 0.005) { console.error('ЮKassa: сумма пополнения не совпала', t.id); return t.status; }
+    const cl = await db.connect();
+    try {
+      await cl.query('begin');
+      const u = await cl.query(`update topups set status='succeeded' where id=$1 and status='pending'`, [t.id]); // защита от двойного зачисления
+      if (u.rowCount) await cl.query('update users set balance=balance+$1 where id=$2', [t.amount, t.user_id]);
+      await cl.query('commit');
+      if (u.rowCount) tgNotifyUser(t.user_id, `Баланс пополнен на ${Number(t.amount)} ₽.`);
+    } catch (e) { await cl.query('rollback'); throw e; } finally { cl.release(); }
+    return 'succeeded';
+  }
+  if (d.status === 'canceled') { await db.query(`update topups set status='canceled' where id=$1 and status='pending'`, [t.id]); return 'canceled'; }
+  return t.status;
+}
 // Статус платежа берём только у самой ЮKassa (а не из присланного запроса), и сверяем сумму
 async function ykSettle(paymentId) {
   const { ok, d } = await yk('GET', '/payments/' + encodeURIComponent(paymentId));
   if (!ok) return null;
+  const t = (await db.query('select id,user_id,amount,status from topups where payment_id=$1', [paymentId])).rows[0];
+  if (t) return settleTopup(t, d);
   const o = (await db.query('select id,user_id,total,status from orders where payment_id=$1', [paymentId])).rows[0];
   if (!o) return null;
   if (d.status === 'succeeded' && d.paid) {
@@ -160,6 +179,43 @@ app.get('/api/orders/:id/check', auth, wrap(async (req, res) => {
   if (status === 'Ожидает оплаты' && o.payment_id) status = (await ykSettle(o.payment_id)) || status;
   res.json({ success: true, status });
 }));
+
+// ===== Пополнение баланса через ЮKassa =====
+app.post('/api/balance/topup', auth, wrap(async (req, res) => {
+  const amount = Math.round(Number(req.body.amount) * 100) / 100;
+  if (!Number.isFinite(amount) || amount < 100 || amount > 100000) return bad(res, 'Сумма пополнения от 100 до 100 000 ₽');
+  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) return bad(res, 'Онлайн-оплата пока не подключена', 502);
+  const tid = (await db.query('insert into topups(user_id,amount) values($1,$2) returning id', [req.user.id, amount])).rows[0].id;
+  const base = FRONTEND_ORIGIN.split(',')[0].trim();
+  const p = await yk('POST', '/payments', { amount: { value: amount.toFixed(2), currency: 'RUB' }, capture: true,
+    confirmation: { type: 'redirect', return_url: `${base}/profile.html?topup=${tid}` }, description: `Пополнение баланса SMM Archive`, metadata: { topup_id: String(tid) } }, `topup-${tid}`);
+  if (!p.ok || !p.d.confirmation) {
+    console.error('ЮKassa пополнение:', JSON.stringify(p.d).slice(0, 500));
+    await db.query(`update topups set status='canceled' where id=$1`, [tid]);
+    return bad(res, 'Не удалось создать платёж: ' + (p.d.description || 'ошибка ЮKassa'), 502);
+  }
+  await db.query('update topups set payment_id=$1 where id=$2', [p.d.id, tid]);
+  res.json({ success: true, topupId: tid, payUrl: p.d.confirmation.confirmation_url });
+}));
+app.get('/api/balance/topup/:id/check', auth, wrap(async (req, res) => {
+  const id = toId(req.params.id); if (!id) return bad(res, 'Неверный ID');
+  const t = (await db.query('select status,payment_id from topups where id=$1 and user_id=$2', [id, req.user.id])).rows[0];
+  if (!t) return bad(res, 'Пополнение не найдено', 404);
+  let status = t.status;
+  if (status === 'pending' && t.payment_id) status = (await ykSettle(t.payment_id)) || status;
+  const balance = Number((await db.query('select balance from users where id=$1', [req.user.id])).rows[0].balance);
+  res.json({ success: true, status, balance });
+}));
+
+// ===== Аватар пользователя =====
+app.post('/api/auth/avatar', auth, wrap(async (req, res) => {
+  const photo = String(req.body.photo || '');
+  if (!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo)) return bad(res, 'Загрузите фото в формате JPG, PNG или WEBP');
+  if (photo.length > 900000) return bad(res, 'Фото слишком большое (до ~600 КБ)');
+  await db.query('update users set avatar=$1 where id=$2', [photo, req.user.id]);
+  res.json({ success: true, avatar: photo });
+}));
+app.delete('/api/auth/avatar', auth, wrap(async (req, res) => { await db.query('update users set avatar=null where id=$1', [req.user.id]); res.json({ success: true }); }));
 
 app.post('/api/auth/forgot', authLimit, wrap(async (req, res) => {
   const email = String(req.body.email || '').trim();
@@ -198,6 +254,7 @@ app.get('/api/auth/profile', auth, wrap(async (req, res) => {
 // ---------- Публичные данные ----------
 app.get('/api/products', wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows.map(({ supplier_url, ...p }) => p)))); // ссылка поставщика покупателям не отдаётся
 app.get('/api/admin/products', admin, wrap(async (_q, res) => res.json((await db.query('select * from products order by id desc')).rows))); // для админки: вместе со ссылкой поставщика
+app.get('/api/categories', (_q, res) => res.json(Object.entries(CAT_RU).map(([id, name]) => ({ id, name })))); // единый список разделов для сайта и админки
 app.get('/api/news', wrap(async (_q, res) => res.json((await db.query('select * from news order by id desc limit 50')).rows)));
 app.get('/api/reviews', wrap(async (_q, res) => res.json((await db.query('select id,name,rating,comment,created_at from reviews where approved order by id desc limit 50')).rows)));
 app.post('/api/reviews', auth, wrap(async (req, res) => {
@@ -216,13 +273,16 @@ app.post('/api/promo/check', wrap(async (req, res) => {
 app.post('/api/orders', auth, wrap(async (req, res) => {
   const { items, delivery_method, address, name, phone, payment_method, promo } = req.body;
   if (!Array.isArray(items) || !items.length || !name || !phone || !address) return bad(res, 'Заполните все поля заказа');
-  const ids = items.map(i => toId(i.id));
-  if (ids.includes(null)) return bad(res, 'Неверный товар');
-  const pr = (await db.query('select id,title,price from products where id=any($1)', [ids])).rows;
+  const pid = i => toId(i && (i.id ?? i.product_id ?? i.productId)); // корзина на сайте может хранить id под разными именами
+  const qtyOf = i => parseInt(i.qty ?? i.quantity ?? i.count ?? i.amount ?? 1);
+  const ids = items.map(pid);
+  if (ids.includes(null)) return bad(res, 'В корзине некорректный товар. Очистите корзину и добавьте товары заново');
+  const pr = (await db.query('select id,title,price from products where id=any($1::int[])', [ids])).rows;
   let total = 0; const lines = [];
   for (const i of items) {
-    const p = pr.find(x => x.id === toId(i.id)), q = parseInt(i.qty);
-    if (!p || !(q > 0 && q <= 20)) return bad(res, 'Товар не найден или неверное количество');
+    const p = pr.find(x => Number(x.id) === pid(i)), q = qtyOf(i);
+    if (!p) return bad(res, `Товар «${String(i.title || i.name || pid(i)).slice(0, 60)}» больше недоступен (его удалили или изменили). Удалите его из корзины`);
+    if (!(q > 0 && q <= 20)) return bad(res, 'Количество одного товара — от 1 до 20');
     lines.push({ id: p.id, title: p.title, size: String(i.size || '').slice(0, 10), qty: q, price: Number(p.price) });
     total += Number(p.price) * q;
   }
@@ -266,7 +326,7 @@ app.get('/api/orders/my', auth, wrap(async (req, res) => res.json((await db.quer
 
 // ---------- Отчёты о загрузке товаров в Telegram-группу ----------
 const { TELEGRAM_REPORT_CHAT_ID, TELEGRAM_REPORT_BOT_TOKEN, REPORT_TZ = 'Europe/Moscow' } = process.env;
-const CAT_RU = { jackets: 'Куртки', bombers: 'Бомберы', longsleeve: 'Лонгсливы', tshirt: 'Футболки', pants: 'Штаны', shoes: 'Обувь', bags: 'Сумки', accessories: 'Аксессуары', set: 'Сет одежды', other: 'Другое' };
+const CAT_RU = { jackets: 'Куртки', bombers: 'Бомберы', zip: 'Zip кофты', hoodie: 'Худи', longsleeve: 'Лонгсливы', tshirt: 'Футболки', pants: 'Штаны', shoes: 'Обувь', bags: 'Сумки', accessories: 'Аксессуары', set: 'Сет одежды', other: 'Другое' };
 const h = v => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const cleanUrl = v => { const u = String(v || '').trim().slice(0, 1000); return /^https?:\/\//i.test(u) ? u : null; };
 async function sendProductReport(action, adminId, product) {
@@ -400,5 +460,8 @@ async function seedAdmin() {
     [ADMIN_LOGIN, ADMIN_EMAIL, await bcrypt.hash(ADMIN_PASSWORD, 10), crypto.randomBytes(4).toString('hex').toUpperCase()]);
   console.log('Админ готов:', ADMIN_LOGIN);
 }
-db.query('alter table products add column if not exists supplier_url text').then(() => db.query('alter table orders add column if not exists payment_id text')).then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
+db.query('alter table products add column if not exists supplier_url text').then(() => db.query('alter table orders add column if not exists payment_id text'))
+  .then(() => db.query('alter table users add column if not exists avatar text'))
+  .then(() => db.query(`create table if not exists topups(id serial primary key, user_id int not null references users(id) on delete cascade, amount numeric(12,2) not null,
+    payment_id text, status text not null default 'pending', created_at timestamptz default now())`)).then(seedAdmin).then(() => app.listen(PORT, () => { console.log('Server started on port', PORT); setupTelegram().catch(e => console.error('setupTelegram', e.message)); }))
   .catch(e => { console.error('Не удалось подключиться к базе:', e.message); process.exit(1); });
